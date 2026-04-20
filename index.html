@@ -302,44 +302,54 @@
     img.src = url;
   });
 
-  // ---------- Parsing feet / inch ----------
-  function parseDimension(rawText) {
-    if (!rawText) return null;
-    // Normalize smart quotes
-    let t = rawText
-      .replace(/\u2018|\u2019|\u02BC/g, "'")
+  // ---------- OCR normalization (fix typical confusions) ----------
+  function normalizeOcrText(raw) {
+    if (!raw) return '';
+    return raw
+      .replace(/\u2018|\u2019|\u02BC|\u0060|\u00B4/g, "'")
       .replace(/\u201C|\u201D|\u2033/g, '"')
+      .replace(/''/g, '"')
+      .replace(/[lI|!\]\[\)\(]/g, '1')
+      .replace(/[Oo]/g, '0')
+      .replace(/[Ss](?=['"]|\d|$)/g, '5')
+      .replace(/[Zz](?=['"]|\d|$)/g, '2')
+      .replace(/[Bb](?=['"]|\d|$)/g, '8')
+      .replace(/[gq]/g, '9')
       .replace(/\s+/g, '')
       .trim();
-    if (!t) return null;
+  }
 
-    // 5'6"  5'-6"  5'6  5'-6
-    let m = t.match(/^(\d+(?:\.\d+)?)'-?(\d+(?:\.\d+)?)"?$/);
-    if (m) {
+  // ---------- Parsing feet / inch ----------
+  function parseDimension(rawText) {
+    const t = normalizeOcrText(rawText);
+    if (!t || t.length < 2) return null;
+
+    // feet + inches: 5'6"  5'-6"  5'6  5'-6"
+    let m = t.match(/^(\d+(?:\.\d+)?)['"]-?(\d+(?:\.\d+)?)["']?$/);
+    if (m && /['"]/.test(t)) {
       return parseFloat(m[1]) * 0.3048 + parseFloat(m[2]) * 0.0254;
     }
-    // 10ft   5'
+    // feet only
     m = t.match(/^(\d+(?:\.\d+)?)(?:ft|feet|')$/i);
     if (m) return parseFloat(m[1]) * 0.3048;
-    // 24in   12"
+    // inches only
     m = t.match(/^(\d+(?:\.\d+)?)(?:in|inch|inches|")$/i);
     if (m) return parseFloat(m[1]) * 0.0254;
     return null;
   }
 
   function formatMeters(meters, unit) {
-    if (unit === 'mm') {
-      return Math.round(meters * 1000) + ' mm';
-    }
+    if (unit === 'mm') return Math.round(meters * 1000) + ' mm';
     const m = Math.round(meters * 1000) / 1000;
-    let s = m.toFixed(3);
-    s = s.replace(/\.?0+$/, '');
+    let s = m.toFixed(3).replace(/\.?0+$/, '');
     return s + ' m';
   }
 
   // ---------- Merge adjacent OCR words on same line ----------
   function mergeAdjacentWords(words) {
-    const valid = words.filter(w => w && w.text && w.bbox && (w.confidence == null || w.confidence > 30));
+    const valid = words.filter(w =>
+      w && w.text && w.bbox && (w.confidence == null || w.confidence > 20)
+    );
     const sorted = valid.slice().sort((a, b) => {
       const dy = a.bbox.y0 - b.bbox.y0;
       if (Math.abs(dy) > 10) return dy;
@@ -358,10 +368,10 @@
       for (let j = i + 1; j < sorted.length; j++) {
         if (used.has(j)) continue;
         const b = sorted[j];
-        const sameLine = Math.abs(b.bbox.y0 - merged.bbox.y0) < height * 0.6;
+        const sameLine = Math.abs(b.bbox.y0 - merged.bbox.y0) < height * 0.7;
         const gap = b.bbox.x0 - merged.bbox.x1;
         if (!sameLine) continue;
-        if (gap > height * 0.9) continue;
+        if (gap > height * 1.2) continue;
         if (gap < -height) continue;
         merged.text += b.text;
         merged.bbox.x1 = Math.max(merged.bbox.x1, b.bbox.x1);
@@ -375,32 +385,79 @@
     return out;
   }
 
-  function drawReplacementText(ctx, bbox, newText) {
-    const x = bbox.x0, y = bbox.y0;
-    const w = bbox.x1 - bbox.x0;
-    const h = bbox.y1 - bbox.y0;
-    const padX = Math.max(6, h * 0.25);
-    const padY = Math.max(3, h * 0.15);
+  // ---------- Rotate canvas by a multiple of 90° ----------
+  function makeRotatedCanvas(srcCanvas, angleDeg) {
+    const w = srcCanvas.width, h = srcCanvas.height;
+    const a = ((angleDeg % 360) + 360) % 360;
+    const rw = (a === 90 || a === 270) ? h : w;
+    const rh = (a === 90 || a === 270) ? w : h;
+    const c = document.createElement('canvas');
+    c.width = rw; c.height = rh;
+    const cx = c.getContext('2d');
+    cx.save();
+    cx.translate(rw / 2, rh / 2);
+    cx.rotate(a * Math.PI / 180);
+    cx.drawImage(srcCanvas, -w / 2, -h / 2);
+    cx.restore();
+    return c;
+  }
+
+  // ---------- Map bbox from rotated image back to original ----------
+  function bboxToOriginalPolygon(bbox, angleDeg, srcW, srcH) {
+    const a = ((angleDeg % 360) + 360) % 360;
+    const rw = (a === 90 || a === 270) ? srcH : srcW;
+    const rh = (a === 90 || a === 270) ? srcW : srcH;
+    const corners = [
+      { x: bbox.x0, y: bbox.y0 },
+      { x: bbox.x1, y: bbox.y0 },
+      { x: bbox.x1, y: bbox.y1 },
+      { x: bbox.x0, y: bbox.y1 },
+    ];
+    const cos = Math.cos(-a * Math.PI / 180);
+    const sin = Math.sin(-a * Math.PI / 180);
+    return corners.map(p => {
+      const dx = p.x - rw / 2;
+      const dy = p.y - rh / 2;
+      return {
+        x: dx * cos - dy * sin + srcW / 2,
+        y: dx * sin + dy * cos + srcH / 2,
+      };
+    });
+  }
+
+  // ---------- Draw replacement text, rotated to match source orientation ----------
+  function drawReplacementTextRotated(ctx, polygon, newText, angleDeg) {
+    // polygon: [TL, TR, BR, BL] in original coordinates
+    const cx = (polygon[0].x + polygon[2].x) / 2;
+    const cy = (polygon[0].y + polygon[2].y) / 2;
+    const w = Math.hypot(polygon[1].x - polygon[0].x, polygon[1].y - polygon[0].y);
+    const h = Math.hypot(polygon[3].x - polygon[0].x, polygon[3].y - polygon[0].y);
+    const padX = Math.max(6, h * 0.3);
+    const padY = Math.max(4, h * 0.2);
+    const rad = -angleDeg * Math.PI / 180;
 
     ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(rad);
+
     ctx.fillStyle = '#ffffff';
-    ctx.fillRect(x - padX, y - padY, w + padX * 2, h + padY * 2);
+    ctx.fillRect(-w / 2 - padX, -h / 2 - padY, w + padX * 2, h + padY * 2);
 
-    const fontSize = Math.max(12, Math.round(h * 0.9));
+    let fs = Math.max(12, Math.round(h * 0.95));
     ctx.fillStyle = '#000000';
-    ctx.font = `600 ${fontSize}px -apple-system, "Segoe UI", Arial, sans-serif`;
     ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-
-    // Shrink to fit width
-    let fs = fontSize;
+    ctx.textAlign = 'center';
+    ctx.font = `700 ${fs}px -apple-system, "Segoe UI", Arial, sans-serif`;
     while (fs > 10 && ctx.measureText(newText).width > w + padX * 2) {
       fs -= 1;
-      ctx.font = `600 ${fs}px -apple-system, "Segoe UI", Arial, sans-serif`;
+      ctx.font = `700 ${fs}px -apple-system, "Segoe UI", Arial, sans-serif`;
     }
-
-    ctx.fillText(newText, x, y + h / 2);
+    ctx.fillText(newText, 0, 0);
     ctx.restore();
+  }
+
+  function polygonCenter(poly) {
+    return { x: (poly[0].x + poly[2].x) / 2, y: (poly[0].y + poly[2].y) / 2 };
   }
 
   // ---------- Straighten: Hough Line Transform ----------
@@ -410,19 +467,23 @@
     const gray = new cv.Mat();
     const edges = new cv.Mat();
     const lines = new cv.Mat();
+    let count = 0;
     try {
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
       cv.GaussianBlur(gray, gray, new cv.Size(3, 3), 0);
-      cv.Canny(gray, edges, 50, 150);
+      cv.Canny(gray, edges, 30, 100);
 
-      const minLen = Math.max(30, Math.min(canvas.width, canvas.height) * 0.03);
-      const maxGap = Math.max(8, minLen * 0.25);
-      cv.HoughLinesP(edges, lines, 1, Math.PI / 180, 60, minLen, maxGap);
+      const minSide = Math.min(canvas.width, canvas.height);
+      const minLen = Math.max(20, minSide * 0.02);
+      const maxGap = Math.max(10, minLen * 0.4);
+      const threshold = Math.max(35, Math.round(minLen * 0.8));
+      cv.HoughLinesP(edges, lines, 1, Math.PI / 180, threshold, minLen, maxGap);
 
+      const stroke = Math.max(2, Math.round(minSide / 600));
       const ctx = canvas.getContext('2d');
       ctx.save();
       ctx.strokeStyle = '#000000';
-      ctx.lineWidth = 2;
+      ctx.lineWidth = stroke;
       ctx.lineCap = 'round';
 
       for (let i = 0; i < lines.rows; i++) {
@@ -434,11 +495,10 @@
         const dx = Math.abs(x2 - x1);
         const dy = Math.abs(y2 - y1);
         const angle = Math.abs(Math.atan2(y2 - y1, x2 - x1) * 180 / Math.PI);
-        // Snap near-horizontal
-        if (dx > dy && (angle < 7 || Math.abs(angle - 180) < 7)) {
+        if (dx > dy && (angle < 8 || Math.abs(angle - 180) < 8)) {
           const yy = Math.round((y1 + y2) / 2);
           sy1 = yy; sy2 = yy;
-        } else if (dy > dx && Math.abs(angle - 90) < 7) {
+        } else if (dy > dx && Math.abs(angle - 90) < 8) {
           const xx = Math.round((x1 + x2) / 2);
           sx1 = xx; sx2 = xx;
         }
@@ -446,11 +506,13 @@
         ctx.moveTo(sx1, sy1);
         ctx.lineTo(sx2, sy2);
         ctx.stroke();
+        count++;
       }
       ctx.restore();
     } finally {
       src.delete(); gray.delete(); edges.delete(); lines.delete();
     }
+    return count;
   }
 
   // ---------- Main pipeline ----------
@@ -471,34 +533,63 @@
       const doOCR = $('doOCR').checked;
       const unit = document.querySelector('input[name="unit"]:checked').value;
 
+      let lineCount = 0;
       if (doStraighten) {
         setStatus('Đang tải OpenCV và phát hiện đường thẳng...');
         await waitForOpenCV(20000);
-        straightenLines(canvas);
+        lineCount = straightenLines(canvas);
+        setStatus(`Đã vẽ lại ${lineCount} đường thẳng. Tiếp tục OCR...`);
       }
 
       if (doOCR) {
-        setStatus('Đang nhận dạng chữ và số (OCR)...');
-        const result = await Tesseract.recognize(canvas, 'eng', {
-          logger: m => {
-            if (m.status) {
-              const pct = m.progress != null ? Math.round(m.progress * 100) : 0;
-              setStatus(`OCR: ${m.status} — ${pct}%`);
+        const angles = [0, 90, 180, 270];
+        const detections = [];
+        for (let i = 0; i < angles.length; i++) {
+          const a = angles[i];
+          setStatus(`Đang OCR ở góc ${a}° (${i + 1}/${angles.length})...`);
+          const working = (a === 0) ? canvas : makeRotatedCanvas(canvas, a);
+          const result = await Tesseract.recognize(working, 'eng', {
+            logger: m => {
+              if (m.status && m.progress != null) {
+                const pct = Math.round(m.progress * 100);
+                setStatus(`OCR ${a}°: ${m.status} — ${pct}% (${i + 1}/${angles.length})`);
+              }
             }
-          },
-          tessedit_char_whitelist: "0123456789'\"-ftinFTIN. "
-        });
-        const words = (result.data && result.data.words) || [];
-        const merged = mergeAdjacentWords(words);
-        let replaced = 0;
-        for (const w of merged) {
-          const val = parseDimension(w.text);
-          if (val !== null && val > 0) {
-            drawReplacementText(ctx, w.bbox, formatMeters(val, unit));
-            replaced++;
+          });
+          const words = (result.data && result.data.words) || [];
+          const merged = mergeAdjacentWords(words);
+          for (const w of merged) {
+            const val = parseDimension(w.text);
+            if (val == null || val <= 0 || val > 1000) continue;
+            const poly = bboxToOriginalPolygon(w.bbox, a, canvas.width, canvas.height);
+            detections.push({
+              text: w.text,
+              value: val,
+              angle: a,
+              polygon: poly,
+              confidence: w.confidence || 0,
+            });
           }
         }
-        setStatus(`Hoàn tất: đã thay ${replaced} giá trị đơn vị.`);
+
+        // Dedupe: drop detections whose center is close to an already-accepted one
+        detections.sort((x, y) => y.confidence - x.confidence);
+        const accepted = [];
+        const minDist = Math.max(24, Math.min(canvas.width, canvas.height) * 0.02);
+        for (const d of detections) {
+          const c = polygonCenter(d.polygon);
+          const near = accepted.some(a => {
+            const ac = polygonCenter(a.polygon);
+            return Math.hypot(ac.x - c.x, ac.y - c.y) < minDist;
+          });
+          if (!near) accepted.push(d);
+        }
+
+        for (const d of accepted) {
+          drawReplacementTextRotated(ctx, d.polygon, formatMeters(d.value, unit), d.angle);
+        }
+
+        setStatus(`Hoàn tất: đã thay ${accepted.length} giá trị đơn vị (OCR ${angles.length} góc xoay).`);
       } else {
         setStatus('Hoàn tất xử lý ảnh.');
       }
